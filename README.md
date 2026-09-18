@@ -6,7 +6,7 @@ Il gioco reinterpreta il classico gameplay di Snake a tema Spider-Man, sfruttand
 
 ---
 
-## 🎮 Caratteristiche Principali
+## Caratteristiche Principali
 
 - **Schermo Superiore (Main 2D Engine - Mode 5)**:
   - Framebuffer bitmap 16-bit RGB555 nativo ($256 \times 192$).
@@ -27,7 +27,7 @@ Il gioco reinterpreta il classico gameplay di Snake a tema Spider-Man, sfruttand
 
 ---
 
-## 📁 Struttura del Progetto
+## Struttura del Progetto
 
 ```text
 spiderman-snake/
@@ -49,7 +49,7 @@ spiderman-snake/
 
 ---
 
-## 🛠️ Requisiti di Compilazione
+## Requisiti di Compilazione
 
 Per compilare la ROM `.nds` sono richiesti:
 - **devkitPro** con pacchetto **devkitARM**
@@ -59,7 +59,7 @@ Per compilare la ROM `.nds` sono richiesti:
 
 ---
 
-## 🚀 Istruzioni di Build
+## Istruzioni di Build
 
 ### Compilazione tramite ambiente Docker / Script batch
 Se utilizzi il container Docker preconfigurato, avvia semplicemente:
@@ -83,7 +83,7 @@ La ROM può essere testata direttamente su emulatori compatibili (come **melonDS
 
 ---
 
-## 🕹️ Controlli di Gioco
+## Controlli di Gioco
 
 | Tasto | Azione |
 | :--- | :--- |
