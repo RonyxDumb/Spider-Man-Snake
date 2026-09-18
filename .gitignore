@@ -1,0 +1,32 @@
+# ==============================================================================
+# Spider-Man Snake Standalone - Git Ignore Rules
+# ==============================================================================
+
+# Directory di output della compilazione (oggetti, dipendenze, file intermedi)
+build/
+nitro/
+
+# Artefatti binari eseguibili e ROM Nintendo DS
+*.elf
+*.nds
+*.map
+*.o
+*.d
+*.bin
+*.raw
+
+# File temporanei di sistema operativo ed editor
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Ambienti di sviluppo e IDE (VS Code, CLion, ecc.)
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+
+# Log e file di dump
+*.log

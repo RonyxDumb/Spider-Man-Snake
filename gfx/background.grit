@@ -1,0 +1,6 @@
+# Modalità bitmap 16-bit pura per NDS (ARGB1555 con BIT(15) abilitato)
+-gb
+-gB16
+-gT!
+-m!
+-fts
