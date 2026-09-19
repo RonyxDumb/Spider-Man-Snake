@@ -762,6 +762,23 @@ int main(void) {
         else if (currentState == STATE_GAME) {
             updateGame(&currentState);
 
+            /*
+             * updateGame() puo' cambiare stato da STATE_GAME a STATE_INTRO
+             * quando dal Game Over si sceglie di tornare al menu.
+             *
+             * In quel caso NON dobbiamo continuare a renderizzare questo frame
+             * come gameplay: gameOver viene azzerato durante la transizione e
+             * drawSprites(false) riattiverebbe Snake e Food sopra l'intro.
+             *
+             * Nascondiamo quindi immediatamente tutti gli sprite OAM e saltiamo
+             * il resto del rendering dello stato GAME.
+             */
+            if (currentState != STATE_GAME) {
+                drawSprites(true);
+                swiWaitForVBlank();
+                continue;
+            }
+
             /* Pulisce e riposiziona il cursore */
             iprintf("\x1b[2J\x1b[1;1H");
 
