@@ -27,6 +27,7 @@ desktop.ini
 *.swp
 *~
 *.bak
+.git/
 
 # Log e file di dump
 *.log

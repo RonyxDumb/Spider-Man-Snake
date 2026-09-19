@@ -22,10 +22,13 @@
  *    - Impaginazione: Calibrata scrupolosamente per la griglia 32x24 caratteri,
  *      con layout centrate per Intro, HUD di gioco, Pausa e Menu di Game Over.
  * 
- * 3. AUDIO (Maxmod Stream):
- *    - Canali PCM stereo a 16-bit e 22050 Hz gestiti in streaming dal filesystem virtuale NitroFS.
- *    - Riavvolgimento automatico a fine file per garantire il loop continuo.
- *    - Silenziamento istantaneo del buffer sia durante la Pausa che sul Game Over.
+ * 3. AUDIO (libnds + Maxmod Stream):
+ *    - Hardware audio abilitato esplicitamente con soundEnable(): nessuna dipendenza
+ *      dallo stato lasciato dal BIOS, dal firmware, dal launcher o dall'emulatore.
+ *    - PCM stereo 16-bit / 22050 Hz letto da NitroFS.
+ *    - Streaming Maxmod manuale aggiornato dal main loop, senza callback concorrenti
+ *      durante il cambio traccia.
+ *    - Loop continuo, silenzio in Pausa/Game Over e gestione sicura degli errori I/O.
  * 
  * 4. EFFETTI HARDWARE:
  *    - Transizioni tra gli stati gestite tramite i registri di luminosita' master
@@ -36,6 +39,7 @@
 #include <maxmod9.h>
 #include <fat.h>
 #include <filesystem.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +107,9 @@ static int gameOverChoice = 0;
 static u16* snakeGfx;
 static u16* foodGfx;
 static u16* bgMainPtr;
+
+/* Dichiarazione anticipata: le dissolvenze mantengono alimentato lo stream. */
+static void audioUpdate(void);
 
 /* ------------------------------------------------------------------------------
  * PALETTE COLORI SPRITE (Hardware OAM - Spazio colore RGB15: 5 bit per canale)
@@ -212,7 +219,14 @@ static void fadeOut(void) {
     for (int b = 0; b >= -16; b--) {
         setBrightness(1, b);
         setBrightness(2, b);
+
+        /*
+         * La dissolvenza dura piu' del buffer audio. Con lo streaming manuale
+         * continuiamo quindi a rifornire Maxmod anche durante il fade.
+         */
+        audioUpdate();
         swiWaitForVBlank();
+        audioUpdate();
         swiWaitForVBlank();
     }
 }
@@ -222,77 +236,208 @@ static void fadeIn(void) {
     for (int b = -16; b <= 0; b++) {
         setBrightness(1, b);
         setBrightness(2, b);
+
+        audioUpdate();
         swiWaitForVBlank();
+        audioUpdate();
         swiWaitForVBlank();
     }
 }
 
 /* ------------------------------------------------------------------------------
- * GESTIONE STREAMING AUDIO (MAXMOD)
+ * GESTIONE AUDIO: LIBNDS + MAXMOD + NITROFS
+ * ------------------------------------------------------------------------------
+ *
+ * Strategia adottata:
+ *
+ * 1. soundEnable() viene chiamato esplicitamente all'avvio.
+ *    Non bisogna dipendere dallo stato audio lasciato dal BIOS, dal firmware,
+ *    dal launcher o dall'emulatore.
+ *
+ * 2. Maxmod viene inizializzato UNA SOLA VOLTA con mmInit(&sys), senza soundbank.
+ *    Le tracce sono PCM grezze e non richiedono un soundbank.
+ *
+ * 3. Lo stream e' MANUALE (manual = true).
+ *    mmStreamUpdate() viene chiamato dal main loop. In questo modo il callback
+ *    non accede al FILE* da un thread automatico mentre il gioco cambia traccia.
+ *
+ * 4. Ogni cambio traccia chiude prima lo stream, poi il file precedente,
+ *    apre il nuovo file da NitroFS e infine riapre lo stream. Questo elimina
+ *    buffer residui e rende le transizioni ripetibili.
+ *
+ * 5. Il callback gestisce EOF ed errori di lettura senza poter entrare in un
+ *    ciclo infinito. In caso di errore, la parte restante del buffer e' silenzio.
  * ------------------------------------------------------------------------------ */
+
 static FILE* musicFp = NULL;
-static bool audioStreaming = false;
+static bool audioCoreReady = false;
+static bool audioStreamOpen = false;
+static bool nitroFsReady = false;
 
 /*
- * Callback audio invocata periodicamente dal mixer hardware di Maxmod.
- * Riempie il buffer di destinazione con campioni PCM stereo a 16-bit.
+ * Chiude in ordine sicuro le risorse della traccia corrente.
+ * Con lo streaming manuale non esiste un callback concorrente che possa usare
+ * musicFp mentre viene chiuso.
  */
-static mm_word musicCallback(mm_word length, mm_addr dest, mm_stream_formats format) {
-    if (!musicFp || format != MM_STREAM_16BIT_STEREO)
-        return 0;
-
-    /*
-     * Silenzia istantaneamente l'audio azzerando il buffer di campioni
-     * quando la partita e' in pausa oppure quando si e' perso.
-     */
-    if (isPaused || gameOver) {
-        memset(dest, 0, length * 4);
-        return length;
+static void audioCloseTrack(void) {
+    if (audioStreamOpen) {
+        mmStreamClose();
+        audioStreamOpen = false;
     }
 
-    size_t wantedBytes = (size_t)length * 4;
-    size_t got = fread(dest, 1, wantedBytes, musicFp);
-
-    /* Riavvolgimento all'inizio per creare un loop infinito */
-    if (got < wantedBytes) {
-        fseek(musicFp, 0, SEEK_SET);
-        size_t remaining = wantedBytes - got;
-        got += fread((u8*)dest + got, 1, remaining, musicFp);
-    }
-
-    return (mm_word)(got / 4);
-}
-
-/*
- * Cambia traccia audio chiudendo la precedente e aprendo il nuovo file PCM da NitroFS.
- */
-static void switchTrack(const char* filename) {
     if (musicFp) {
         fclose(musicFp);
         musicFp = NULL;
     }
+}
 
-    char nitroPath[64];
+/*
+ * Callback di Maxmod.
+ *
+ * "length" e' espresso in campioni/frame stereo, non in byte.
+ * Con PCM stereo 16-bit ogni frame occupa 4 byte:
+ *   2 byte canale sinistro + 2 byte canale destro.
+ */
+static mm_word musicCallback(mm_word length, mm_addr dest, mm_stream_formats format) {
+    if (!dest || format != MM_STREAM_16BIT_STEREO)
+        return 0;
+
+    u8* output = (u8*)dest;
+    const size_t totalBytes = (size_t)length * 4;
+    size_t filled = 0;
+
+    /* Pausa e Game Over: manteniamo vivo lo stream ma inviamo silenzio. */
+    if (!musicFp || isPaused || gameOver) {
+        memset(output, 0, totalBytes);
+        return length;
+    }
+
+    while (filled < totalBytes) {
+        size_t got = fread(output + filled, 1, totalBytes - filled, musicFp);
+
+        if (got > 0) {
+            filled += got;
+            continue;
+        }
+
+        /*
+         * EOF normale: azzera lo stato FILE, torna all'inizio e prova UNA volta.
+         * Se il file e' vuoto, corrotto o il seek fallisce, usciamo senza loop.
+         */
+        clearerr(musicFp);
+
+        if (fseek(musicFp, 0, SEEK_SET) != 0)
+            break;
+
+        got = fread(output + filled, 1, totalBytes - filled, musicFp);
+
+        if (got == 0)
+            break;
+
+        filled += got;
+    }
+
+    /* Qualsiasi parte non letta diventa silenzio invece di contenere dati sporchi. */
+    if (filled < totalBytes)
+        memset(output + filled, 0, totalBytes - filled);
+
+    return length;
+}
+
+/*
+ * Inizializza l'hardware audio e Maxmod una sola volta.
+ *
+ * Nota importante:
+ * soundEnable() e' intenzionale e NON va rimosso. Un avvio diretto di alcuni
+ * emulatori puo' lasciare l'audio gia' acceso; il boot da firmware puo' invece
+ * presentare uno stato diverso. Il gioco deve inizializzare esplicitamente
+ * l'hardware e non fare affidamento sullo stato precedente.
+ */
+static void audioInit(void) {
+    if (audioCoreReady)
+        return;
+
+    mm_ds_system sys;
+    memset(&sys, 0, sizeof(sys));
+
+    sys.mod_count  = 0;
+    sys.samp_count = 0;
+    sys.mem_bank   = NULL;
+
+    mmInit(&sys);
+
+    audioCoreReady = true;
+}
+
+/*
+ * Apre una traccia PCM contenuta nel NitroFS della ROM.
+ * Restituisce true soltanto se il file esiste, non e' vuoto e lo stream e'
+ * stato configurato.
+ */
+static bool audioPlayTrack(const char* filename) {
+    if (!audioCoreReady || !nitroFsReady || !filename)
+        return false;
+
+    audioCloseTrack();
+
+    char nitroPath[96];
     snprintf(nitroPath, sizeof(nitroPath), "nitro:/%s", filename);
+
     musicFp = fopen(nitroPath, "rb");
-    if (!musicFp) musicFp = fopen(filename, "rb");
+    if (!musicFp)
+        return false;
 
-    if (!audioStreaming && musicFp) {
-        mm_ds_system sys;
-        memset(&sys, 0, sizeof(sys));
-        mmInit(&sys);
+    /* Verifica minima: evita di aprire uno stream su un file PCM vuoto. */
+    if (fseek(musicFp, 0, SEEK_END) != 0) {
+        audioCloseTrack();
+        return false;
+    }
 
-        mm_stream stream;
-        memset(&stream, 0, sizeof(stream));
-        stream.sampling_rate = MUSIC_RATE;
-        stream.buffer_length = MUSIC_BUFFER;
-        stream.callback = musicCallback;
-        stream.format = MM_STREAM_16BIT_STEREO;
-        stream.timer = 0;
-        stream.manual = false;
+    long fileSize = ftell(musicFp);
+    if (fileSize <= 0 || fseek(musicFp, 0, SEEK_SET) != 0) {
+        audioCloseTrack();
+        return false;
+    }
 
-        mmStreamOpen(&stream);
-        audioStreaming = true;
+    /*
+     * Inizializzazione a zero deliberata: evita campi/padding non inizializzati
+     * se la struttura Maxmod cambia o viene compilata con toolchain differenti.
+     */
+    mm_stream stream;
+    memset(&stream, 0, sizeof(stream));
+
+    stream.sampling_rate = MUSIC_RATE;
+    stream.buffer_length = MUSIC_BUFFER;
+    stream.callback = musicCallback;
+    stream.format = MM_STREAM_16BIT_STEREO;
+    stream.timer = MM_TIMER0;
+    stream.manual = true;
+
+    mmStreamOpen(&stream);
+    audioStreamOpen = true;
+
+    /* Primo riempimento immediato: la traccia non aspetta il frame successivo. */
+    mmStreamUpdate();
+
+    return true;
+}
+
+/*
+ * Va chiamata una volta per iterazione del main loop.
+ * In modalita' manuale Maxmod non richiama il callback autonomamente.
+ */
+static void audioUpdate(void) {
+    if (audioStreamOpen)
+        mmStreamUpdate();
+}
+
+/* Rilascio ordinato delle risorse audio. */
+static void audioShutdown(void) {
+    audioCloseTrack();
+
+    if (audioCoreReady) {
+        soundDisable();
+        audioCoreReady = false;
     }
 }
 
@@ -350,7 +495,15 @@ static void updateGame(GameState* state) {
             if (gameOverChoice == 0) {
                 /* Scelto SÌ: dissolvenza a nero e ritorno all'intro con audio dedicato */
                 fadeOut();
-                switchTrack("intro.pcm");
+
+                /*
+                 * Il callback produce silenzio durante il Game Over. I flag vanno
+                 * azzerati PRIMA di pre-riempire lo stream della musica dell'intro.
+                 */
+                gameOver = false;
+                isPaused = false;
+
+                audioPlayTrack("intro.pcm");
                 copyMainBackground(_binary_build_intro_background_raw_start, 100);
                 *state = STATE_INTRO;
                 fadeIn();
@@ -520,26 +673,50 @@ int main(void) {
      * Carica il set di caratteri nativo e imposta sfondo nero solido con testo bianco.
      */
     consoleDemoInit();
-    nitroFSInit(NULL);
 
-    /* Imposta la luminosita' a nero su entrambi i display per preparare il Fade In */
+    /*
+     * Prima inizializziamo esplicitamente l'audio.
+     * Questo rende l'avvio indipendente dallo stato lasciato dal boot diretto,
+     * dal firmware del DS o dal launcher usato su hardware reale.
+     */
+    audioInit();
+
+    /*
+     * NitroFS contiene intro.pcm e music.pcm dentro la ROM.
+     * Con NULL, libfilesystem usa argv[0] quando disponibile e puo' ricadere
+     * sull'accesso diretto alla cartuccia negli ambienti che lo supportano.
+     */
+    nitroFsReady = nitroFSInit(NULL);
+
+    /* Imposta la luminosita' a nero prima di caricare la prima scena */
     setBrightness(1, -16);
     setBrightness(2, -16);
 
-    /* Avvia la schermata introduttiva */
     GameState currentState = STATE_INTRO;
-    switchTrack("intro.pcm");
 
-    /* Carica l'immagine dell'intro alla massima luminosita' (100%) */
+    /*
+     * Se NitroFS non e' disponibile il gioco continua comunque senza audio.
+     * Se e' disponibile, la traccia viene aperta in modo deterministico.
+     */
+    if (nitroFsReady) {
+        audioPlayTrack("intro.pcm");
+    }
+
+    /* Carica lo sfondo dell'intro alla massima brillantezza */
     copyMainBackground(_binary_build_intro_background_raw_start, 100);
     drawSprites(true);
 
     int blinkTimer = 0;
+
+    /* Accende gli schermi: viene sempre eseguito anche in assenza di audio */
     fadeIn();
 
     /* Ciclo Principale di Esecuzione */
     while (pmMainLoop()) {
         blinkTimer++;
+
+        /* Mantiene alimentato lo stream PCM in modalita' manuale. */
+        audioUpdate();
 
         /* ----------------------------------------------------------------------
          * STATO: SCHERMATA INTRODUTTIVA
@@ -570,7 +747,7 @@ int main(void) {
             /* Pressione START: transizione a nero e avvio del gameplay */
             if (keys & KEY_START) {
                 fadeOut();
-                switchTrack("music.pcm");
+                audioPlayTrack("music.pcm");
                 startGame();
                 copyMainBackground(_binary_build_background_raw_start, 40);
                 currentState = STATE_GAME;
@@ -635,8 +812,7 @@ int main(void) {
         }
     }
 
-    /* Rilascio delle risorse audio all'uscita */
-    if (musicFp) fclose(musicFp);
-    mmStreamClose();
+    /* Rilascio ordinato dello stream, del file e dell'hardware audio. */
+    audioShutdown();
     return 0;
 }

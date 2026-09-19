@@ -1,167 +1,226 @@
 # ==============================================================================
 # Spider-Man Snake - Nintendo DS
-# Toolchain: devkitPro / devkitARM / libnds / Maxmod
-# Tutti gli artefatti intermedi e finali vengono generati nella cartella build/
+# Toolchain: devkitPro / devkitARM / libnds / Calico / Maxmod
+# ==============================================================================
+#
+# Obiettivi principali di questo Makefile:
+#   1. Compilare il codice ARM9 con il runtime Calico/libnds moderno.
+#   2. Usare l'ARM7 standard di Calico (ds7_maine.elf), compatibile con i servizi
+#      audio usati da libnds e Maxmod.
+#   3. Convertire le due tracce MP3 in PCM stereo 16-bit / 22050 Hz.
+#   4. Inserire i PCM in NitroFS, quindi dentro la ROM .nds finale.
+#   5. Tenere tutti gli artefatti generati nella cartella build/.
+#
+# IMPORTANTE PER L'AUDIO:
+# Il Makefile inserisce davvero intro.pcm e music.pcm nel NitroFS con l'opzione
+# "ndstool -d". L'abilitazione dell'hardware audio, invece, viene fatta in
+# main.c tramite soundEnable() prima dell'inizializzazione di Maxmod.
 # ==============================================================================
 
 .SUFFIXES:
 
 # ------------------------------------------------------------------------------
-# Verifica delle variabili d'ambiente essenziali di devkitPro
+# Verifica ambiente devkitPro
 # ------------------------------------------------------------------------------
 ifeq ($(strip $(DEVKITPRO)),)
-$(error La variabile d'ambiente DEVKITPRO non e' impostata)
+$(error La variabile DEVKITPRO non e' impostata)
 endif
 
 ifeq ($(strip $(DEVKITARM)),)
-$(error La variabile d'ambiente DEVKITARM non e' impostata)
+$(error La variabile DEVKITARM non e' impostata)
 endif
 
-ifeq ($(strip $(CALICO)),)
-CALICO := $(DEVKITPRO)/calico
-endif
-
-# Inclusione delle regole standard per Nintendo DS fornite da devkitARM
+# Le regole ufficiali impostano, tra le altre cose, CC e gli strumenti devkitARM.
 include $(DEVKITARM)/ds_rules
 
 # ------------------------------------------------------------------------------
-# Configurazione percorsi e nomi target
+# Percorsi del progetto
 # ------------------------------------------------------------------------------
 TARGET_NAME := spiderman-snake
 BUILD       := build
 SOURCES     := source
-INCLUDES    := include
-GRAPHICS    := gfx
 NITRO       := $(BUILD)/nitro
 
+TARGET_ELF  := $(BUILD)/$(TARGET_NAME).elf
+TARGET_NDS  := $(BUILD)/$(TARGET_NAME).nds
+
+# Calico viene normalmente definito da ds_rules; questo fallback rende il file
+# piu' leggibile e utilizzabile anche in ambienti dove non sia gia' esportato.
+ifeq ($(strip $(CALICO)),)
+CALICO := $(DEVKITPRO)/calico
+endif
+
 # ------------------------------------------------------------------------------
-# Informazioni ROM e Banner Nintendo DS (3 stringhe separate)
+# Metadati visualizzati nel menu Nintendo DS
 # ------------------------------------------------------------------------------
-ROM_TITLE    := SPIDER-MAN # Titolo ROM
-ROM_SUBTITLE := Snake standalone # Sottotitolo
-ROM_AUTHOR   := By Francesco Pio Pipino # Autore
+ROM_TITLE    := SPIDER-MAN
+ROM_SUBTITLE := Snake standalone
+ROM_AUTHOR   := By Francesco Pio Pipino
+ROM_BANNER_INFO := $(ROM_TITLE);$(ROM_SUBTITLE);$(ROM_AUTHOR)
 
-ROM_BANNER_INFO := "$(ROM_TITLE);$(ROM_SUBTITLE);$(ROM_AUTHOR)"
+ICON_SRC   := icon.bmp
+ICON_FIXED := $(BUILD)/icon.bmp
 
-# Flag di compilazione per l'architettura ARM9 (processore principale del Nintendo DS)
-ARCH := -march=armv5te -mtune=arm946e-s -mthumb
-
-# Specifiche Calico per la gestione della memoria e degli interrupt dell'ARM9
+# ------------------------------------------------------------------------------
+# Configurazione ARM9
+# ------------------------------------------------------------------------------
+ARCH  := -march=armv5te -mtune=arm946e-s -mthumb
 SPECS := -specs=$(CALICO)/share/ds9.specs
 
-# Parametri del compilatore C
-CFLAGS := $(SPECS) -g -O2 -Wall -Wextra -ffunction-sections -fdata-sections \
-	$(ARCH) -DARM9 -D__CALICO_ARM9__ -D__NDS__ \
+# Una sola definizione di CFLAGS: nella versione precedente CFLAGS compariva due
+# volte e la seconda definizione annullava -fdiagnostics-color=always.
+CFLAGS := $(SPECS) -g -O2 -Wall -Wextra \
+	-ffunction-sections -fdata-sections \
+	-fdiagnostics-color=always \
+	$(ARCH) \
+	-DARM9 -D__CALICO_ARM9__ -D__NDS__ \
 	-I$(CALICO)/include \
 	-I$(DEVKITPRO)/libnds/include \
 	-I$(CURDIR)/include \
 	-I$(CURDIR)/$(BUILD)
 
-# Parametri del linker
 LDFLAGS := $(SPECS) -g $(ARCH) \
 	-Wl,-Map,$(BUILD)/$(TARGET_NAME).map \
 	-L$(DEVKITPRO)/libnds/lib \
 	-L$(CALICO)/lib
 
-# Librerie di sistema collegate (audio Maxmod, filesystem, libnds base e runtime Calico)
+# Ordine intenzionale: Maxmod e filesystem prima delle librerie base.
 LIBS := -lmm9 -lfilesystem -lfat -lnds9 -lcalico_ds9
 
-# Scansione automatica dei sorgenti C e calcolo degli oggetti intermedi
+# ------------------------------------------------------------------------------
+# Sorgenti C
+# ------------------------------------------------------------------------------
 CFILES := $(wildcard $(SOURCES)/*.c)
 OFILES := $(patsubst $(SOURCES)/%.c,$(BUILD)/%.o,$(CFILES))
 DEPS   := $(OFILES:.o=.d)
 
-# File RAW lineari e oggetti compilati per lo sfondo principale
+# ------------------------------------------------------------------------------
+# Grafica RAW incorporata nell'ARM9
+# ------------------------------------------------------------------------------
 BACKGROUND_RAW := $(BUILD)/background.raw
 BACKGROUND_O   := $(BUILD)/background_bin.o
 
-# File RAW lineari e oggetti compilati per lo sfondo dell'intro
 INTRO_BG_RAW   := $(BUILD)/intro_background.raw
 INTRO_BG_O     := $(BUILD)/intro_background_bin.o
 
-# File per l'icona a 16 colori visualizzata nel menu di sistema del DS
-ICON_SRC   := icon.bmp
-ICON_FIXED := $(BUILD)/icon.bmp
-
-# Tracce audio in formato MP3 e rispettivi flussi PCM per NitroFS
+# ------------------------------------------------------------------------------
+# Audio: sorgenti MP3 -> PCM grezzo nel NitroFS
+# ------------------------------------------------------------------------------
 MUSIC_MP3 := data/music.mp3
 MUSIC_PCM := $(NITRO)/music.pcm
 
 INTRO_MP3 := data/intro.mp3
 INTRO_PCM := $(NITRO)/intro.pcm
 
-# Destinazioni finali del binario ELF e della ROM NDS
-TARGET_ELF := $(BUILD)/$(TARGET_NAME).elf
-TARGET_NDS := $(BUILD)/$(TARGET_NAME).nds
-
 # ------------------------------------------------------------------------------
-# Regole di Compilazione
+# Target principali
 # ------------------------------------------------------------------------------
 .PHONY: all clean
 
 all: $(TARGET_NDS)
+	@printf '\033[0m'
 
-# Creazione delle directory interne per isolare la build dalla root
 $(BUILD):
-	mkdir -p "$@"
+	@mkdir -p "$@"
 
 $(NITRO):
-	mkdir -p "$@"
+	@mkdir -p "$@"
 
-# Conversione dell'immagine di sfondo di gioco a 256x192 in RAW 15-bit RGB555
+# ------------------------------------------------------------------------------
+# Conversione sfondi: PNG 256x192 -> BGR555 little-endian
+# ------------------------------------------------------------------------------
 $(BACKGROUND_RAW): gfx/background.png | $(BUILD)
-	@echo "  CONVERSIONE SFONDO GIOCO RAW (256x192): $< -> $@"
-	ffmpeg -y -i "$<" -vf "scale=256:192" -f rawvideo -pix_fmt bgr555le "$@"
+	@printf '\033[36mRAW\033[0m    %s -> %s\n' "$<" "$@"
+	@ffmpeg -hide_banner -loglevel error -y \
+		-i "$<" -vf "scale=256:192" \
+		-f rawvideo -pix_fmt bgr555le "$@"
 
-# Generazione dell'oggetto ELF linkabile dal file binario dello sfondo di gioco
 $(BACKGROUND_O): $(BACKGROUND_RAW)
-	@echo "  OBJCOPY SFONDO GIOCO: $< -> $@"
-	arm-none-eabi-objcopy -I binary -O elf32-littlearm -B arm --rename-section .data=.rodata "$<" "$@"
+	@printf '\033[36mBIN2O\033[0m  %s -> %s\n' "$<" "$@"
+	@arm-none-eabi-objcopy \
+		-I binary -O elf32-littlearm -B arm \
+		--rename-section .data=.rodata "$<" "$@"
 
-# Conversione dell'immagine di sfondo dell'intro a 256x192 in RAW 15-bit RGB555
 $(INTRO_BG_RAW): gfx/intro_background.png | $(BUILD)
-	@echo "  CONVERSIONE SFONDO INTRO RAW (256x192): $< -> $@"
-	ffmpeg -y -i "$<" -vf "scale=256:192" -f rawvideo -pix_fmt bgr555le "$@"
+	@printf '\033[36mRAW\033[0m    %s -> %s\n' "$<" "$@"
+	@ffmpeg -hide_banner -loglevel error -y \
+		-i "$<" -vf "scale=256:192" \
+		-f rawvideo -pix_fmt bgr555le "$@"
 
-# Generazione dell'oggetto ELF linkabile dal file binario dello sfondo dell'intro
 $(INTRO_BG_O): $(INTRO_BG_RAW)
-	@echo "  OBJCOPY SFONDO INTRO: $< -> $@"
-	arm-none-eabi-objcopy -I binary -O elf32-littlearm -B arm --rename-section .data=.rodata "$<" "$@"
+	@printf '\033[36mBIN2O\033[0m  %s -> %s\n' "$<" "$@"
+	@arm-none-eabi-objcopy \
+		-I binary -O elf32-littlearm -B arm \
+		--rename-section .data=.rodata "$<" "$@"
 
-# Quantizzazione e ridimensionamento dell'icona a 32x32 indicizzata a 16 colori
+# ------------------------------------------------------------------------------
+# Icona banner
+# ------------------------------------------------------------------------------
+# ndstool vuole un BMP; non convertiamo falsamente il file in un formato diverso.
+# La sorgente icon.bmp deve quindi essere gia' una BMP valida per il banner DS.
 $(ICON_FIXED): $(ICON_SRC) | $(BUILD)
-	@echo "  CONVERSIONE ICONA: $< -> $@"
-	ffmpeg -y -i "$<" -filter_complex "[0:v]scale=32:32,split[s0][s1];[s0]palettegen=max_colors=16[p];[s1][p]paletteuse" -pix_fmt pal8 "$@"
+	@printf '\033[36mICON\033[0m   %s -> %s\n' "$<" "$@"
+	@cp "$<" "$@"
 
-# Compilazione di ciascun file C con generazione delle dipendenze automatiche
+# ------------------------------------------------------------------------------
+# Compilazione C
+# ------------------------------------------------------------------------------
 $(BUILD)/%.o: $(SOURCES)/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -MMD -MP -c "$<" -o "$@"
+	@printf '\033[34mCC\033[0m     \033[36m%s\033[0m\n' "$<"
+	@$(CC) $(CFLAGS) -MMD -MP -c "$<" -o "$@"
 
-# Conversione della musica di gioco in PCM grezzo a 22050Hz stereo 16-bit
+# ------------------------------------------------------------------------------
+# Conversione audio
+# ------------------------------------------------------------------------------
+# Il formato deve combaciare ESATTAMENTE con musicCallback() in main.c:
+#   - signed PCM little-endian
+#   - 16 bit
+#   - stereo interleaved
+#   - 22050 Hz
 $(MUSIC_PCM): $(MUSIC_MP3) | $(NITRO)
-	@echo "  CONVERSIONE AUDIO IN-GAME: $< -> $@"
-	ffmpeg -y -i "$<" -ar 22050 -ac 2 -f s16le "$@"
+	@printf '\033[36mAUDIO\033[0m  %s -> %s\n' "$<" "$@"
+	@ffmpeg -hide_banner -loglevel error -y \
+		-i "$<" -vn -ar 22050 -ac 2 \
+		-c:a pcm_s16le -f s16le "$@"
+	@test -s "$@" || (echo "ERRORE: music.pcm e' vuoto" && rm -f "$@" && false)
 
-# Conversione della musica dell'intro in PCM grezzo a 22050Hz stereo 16-bit
 $(INTRO_PCM): $(INTRO_MP3) | $(NITRO)
-	@echo "  CONVERSIONE AUDIO INTRO: $< -> $@"
-	ffmpeg -y -i "$<" -ar 22050 -ac 2 -f s16le "$@"
+	@printf '\033[36mAUDIO\033[0m  %s -> %s\n' "$<" "$@"
+	@ffmpeg -hide_banner -loglevel error -y \
+		-i "$<" -vn -ar 22050 -ac 2 \
+		-c:a pcm_s16le -f s16le "$@"
+	@test -s "$@" || (echo "ERRORE: intro.pcm e' vuoto" && rm -f "$@" && false)
 
-# Collegamento dell'eseguibile ELF contenente codice, grafica e librerie
-$(TARGET_ELF): $(BACKGROUND_O) $(INTRO_BG_O) $(OFILES) $(MUSIC_PCM) $(INTRO_PCM)
-	$(CC) $(LDFLAGS) $(BACKGROUND_O) $(INTRO_BG_O) $(OFILES) $(LIBS) -o "$@"
+# ------------------------------------------------------------------------------
+# Link ARM9
+# ------------------------------------------------------------------------------
+$(TARGET_ELF): $(BACKGROUND_O) $(INTRO_BG_O) $(OFILES) | $(BUILD)
+	@printf '\033[32mLD\033[0m     %s\n' "$@"
+	@$(CC) $(LDFLAGS) \
+		$(BACKGROUND_O) $(INTRO_BG_O) $(OFILES) \
+		$(LIBS) -o "$@"
 
-# Creazione della ROM .nds finale tramite ndstool con banner e filesystem virtuale
+# ------------------------------------------------------------------------------
+# Creazione ROM NDS
+# ------------------------------------------------------------------------------
+# ds7_maine.elf e' l'ARM7 standard previsto dalle ds_rules moderne.
+# -d $(NITRO) incorpora intro.pcm e music.pcm nella ROM come NitroFS.
 $(TARGET_NDS): $(TARGET_ELF) $(MUSIC_PCM) $(INTRO_PCM) $(ICON_FIXED)
-	ndstool -c "$@" \
+	@printf '\033[32mNDS\033[0m    %s\n' "$@"
+	@ndstool -c "$@" \
 		-9 "$(TARGET_ELF)" \
 		-7 "$(CALICO)/bin/ds7_maine.elf" \
 		-b "$(ICON_FIXED)" \
-		$(ROM_BANNER_INFO) \
+		"$(ROM_BANNER_INFO)" \
 		-d "$(NITRO)"
+	@printf '\033[32mOK\033[0m     ROM creata: %s\n' "$@"
 
-# Pulizia di tutti gli artefatti generati
+# ------------------------------------------------------------------------------
+# Pulizia
+# ------------------------------------------------------------------------------
 clean:
-	rm -rf "$(BUILD)"
+	@printf '\033[33mCLEAN\033[0m  %s\n' "$(BUILD)"
+	@rm -rf "$(BUILD)"
+	@printf '\033[0m'
 
 -include $(DEPS)
