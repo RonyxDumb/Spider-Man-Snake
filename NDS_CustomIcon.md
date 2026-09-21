@@ -17,19 +17,6 @@ BMP indicizzato
 15 colori visibili
 indice 0 = trasparenza
 ```
-
-Il file finale deve trovarsi qui:
-
-```text
-src/nds/gfx/icon.bmp
-```
-
-Il file sorgente può essere:
-
-```text
-src/nds/gfx/icon.png
-```
-
 ---
 
 ## 1. Preparare la nuova immagine
@@ -37,7 +24,7 @@ src/nds/gfx/icon.png
 Copiare la propria immagine personalizzata in:
 
 ```text
-src/nds/gfx/icon.png
+projectNDS/icon.png
 ```
 
 Può essere anche più grande di 32×32.
@@ -59,7 +46,7 @@ Le icone Nintendo DS sono molto piccole, quindi dettagli troppo fini verranno pe
 Da WSL / Ubuntu, entrare nella root del progetto:
 
 ```bash
-cd /mnt/c/Users/pipin/Desktop/Spider-Man-Snake
+cd /mnt/c/Users/pipin/Desktop/projectNDS
 ```
 
 Creare una versione 32×32 mantenendo le proporzioni:
